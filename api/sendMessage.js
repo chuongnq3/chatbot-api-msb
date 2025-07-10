@@ -178,87 +178,95 @@
 //   }
 // }
 
+// api/sendMessage.js
+
 export const config = {
     runtime: "nodejs",
-    maxDuration: 60
+    maxDuration: 60 // Tăng timeout cho luồng dữ liệu dài
 };
 
 export default async function handler(req, res) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    /* ------------------------ CORS & pre-flight ------------------------ */
+    res.setHeader("Access-Control-Allow-Origin", "*"); // Hoặc whitelist domain của bạn
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
     if (req.method === "OPTIONS") {
-        return res.status(200).end();
+        return res.status(200).end(); // Dừng sớm cho pre-flight
     }
 
     if (req.method !== "POST") {
         return res.status(405).json({ error: "Method Not Allowed" });
     }
 
+    /* --------------------------- Validate env -------------------------- */
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-        console.error("Missing OPENAI_API_KEY"); // Log lỗi thiếu API Key
+        console.error("Missing OPENAI_API_KEY environment variable.");
         return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
     }
 
+    /* --------------------------- Validate body ------------------------- */
     const {
         userText,
         thread_id: oldThread,
         assistant_id,
         file_ids = [],
-        stream = false
+        stream = false // Cờ yêu cầu streaming từ frontend
     } = req.body ?? {};
 
-    console.log("Received request with:", { userText, oldThread, assistant_id, stream }); // Log dữ liệu đầu vào
-
     if (typeof userText !== "string" || !userText.trim()) {
+        console.error("Invalid userText:", userText);
         return res.status(400).json({ error: "Missing or invalid userText" });
     }
     if (!assistant_id) {
+        console.error("Missing assistant_id.");
         return res.status(400).json({ error: "Missing assistant_id" });
     }
 
     let thread_id = oldThread;
+    console.log(`Request received: userText='${userText}', thread_id='${thread_id}', assistant_id='${assistant_id}', stream=${stream}`);
 
+    // Thiết lập headers cho Server-Sent Events (SSE) nếu yêu cầu streaming
     if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        console.log("Streaming headers set."); // Log khi headers được set
+        // Để ngăn Vercel đóng kết nối quá sớm khi streaming
+        res.write(':\n\n'); // Gửi một comment SSE để keep-alive (hoặc đảm bảo kết nối mở)
+        console.log("SSE headers set for streaming response.");
     }
 
     try {
         /* 1. Tạo thread nếu chưa có */
         if (!thread_id) {
-            console.log("Creating new thread...");
+            console.log("No existing thread_id. Creating a new thread...");
             const threadRes = await fetch("https://api.openai.com/v1/threads", {
                 method: "POST",
                 headers: {
                     Authorization: `Bearer ${apiKey}`,
                     "Content-Type": "application/json",
-                    "OpenAI-Beta": "assistants=v2"
+                    "OpenAI-Beta": "assistants=v2" // Quan trọng cho Assistants API
                 },
                 body: "{}"
             });
 
             if (!threadRes.ok) {
-                const errorText = await threadRes.text();
-                console.error(`Create thread failed: ${threadRes.status} ${errorText}`); // Log lỗi tạo thread
-                throw new Error(
-                    `Create thread failed: ${threadRes.status} ${errorText}`
-                );
+                const errorBody = await threadRes.text();
+                console.error(`Error creating thread: ${threadRes.status} - ${errorBody}`);
+                throw new Error(`Create thread failed: ${threadRes.status} ${errorBody}`);
             }
             const { id } = await threadRes.json();
             thread_id = id;
-            console.log("Thread created:", thread_id); // Log thread ID
+            console.log(`New thread created: ${thread_id}`);
 
+            // Gửi thread_id về ngay lập tức nếu đang streaming để frontend lưu
             if (stream) {
                 res.write(`data: ${JSON.stringify({ thread_id })}\n\n`);
-                console.log("Thread ID streamed to client.");
+                console.log(`Streamed new thread_id: ${thread_id}`);
             }
         } else {
-            console.log("Using existing thread:", thread_id);
+            console.log(`Using existing thread_id: ${thread_id}`);
         }
 
         /* 2. Gửi message của user vào thread */
@@ -270,7 +278,7 @@ export default async function handler(req, res) {
                 }))
                 : undefined;
 
-        console.log("Sending message to thread...");
+        console.log(`Adding message to thread ${thread_id}...`);
         const msgRes = await fetch(
             `https://api.openai.com/v1/threads/${thread_id}/messages`,
             {
@@ -289,16 +297,14 @@ export default async function handler(req, res) {
         );
 
         if (!msgRes.ok) {
-            const errorText = await msgRes.text();
-            console.error(`Create message failed: ${msgRes.status} ${errorText}`); // Log lỗi gửi message
-            throw new Error(
-                `Create message failed: ${msgRes.status} ${errorText}`
-            );
+            const errorBody = await msgRes.text();
+            console.error(`Error creating message: ${msgRes.status} - ${errorBody}`);
+            throw new Error(`Create message failed: ${msgRes.status} ${errorBody}`);
         }
-        console.log("Message sent to thread.");
+        console.log("Message added to thread.");
 
         /* 3. Tạo run cho assistant và xử lý streaming */
-        console.log("Creating run for assistant...");
+        console.log(`Creating run for assistant ${assistant_id} on thread ${thread_id}...`);
         const runRes = await fetch(
             `https://api.openai.com/v1/threads/${thread_id}/runs`,
             {
@@ -311,83 +317,91 @@ export default async function handler(req, res) {
                 body: JSON.stringify({
                     assistant_id,
                     instructions: "Trả lời ngắn gọn, đúng số liệu, bằng tiếng Việt.",
-                    stream: true // Kích hoạt streaming từ OpenAI
+                    stream: true // RẤT QUAN TRỌNG: Kích hoạt streaming từ OpenAI
                 })
             }
         );
 
         if (!runRes.ok) {
-            const errorText = await runRes.text();
-            console.error(`Create run failed: ${runRes.status} ${errorText}`); // Log lỗi tạo run
-            throw new Error(
-                `Create run failed: ${runRes.status} ${errorText}`
-            );
+            const errorBody = await runRes.text();
+            console.error(`Error creating run: ${runRes.status} - ${errorBody}`);
+            throw new Error(`Create run failed: ${runRes.status} ${errorBody}`);
         }
-        console.log("Run created. Starting to read stream...");
+        console.log("Run created. Starting to read OpenAI stream...");
 
         if (stream) {
+            // Đọc luồng từ OpenAI và chuyển tiếp về client (frontend)
             const reader = runRes.body.getReader();
             const decoder = new TextDecoder('utf-8');
-            let accumulatedData = '';
+            let accumulatedData = ''; // Để xử lý các chunk JSON bị cắt đôi
 
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
-                    console.log("Stream from OpenAI finished."); // Log khi luồng kết thúc
-                    break;
+                    console.log("OpenAI stream finished (done signal received).");
+                    break; // Thoát vòng lặp nếu luồng kết thúc
                 }
 
                 accumulatedData += decoder.decode(value, { stream: true });
-                console.log("Accumulated data:", accumulatedData); // Log dữ liệu tích lũy
+                // console.log("Raw accumulated data:", accumulatedData); // Có thể bật để debug chi tiết
 
                 let startIndex = 0;
                 let newlineIndex;
 
+                // Xử lý từng dòng hoàn chỉnh trong accumulatedData
                 while ((newlineIndex = accumulatedData.indexOf('\n', startIndex)) !== -1) {
                     const line = accumulatedData.substring(startIndex, newlineIndex).trim();
-                    console.log("Processing line:", line); // Log từng dòng được xử lý
+                    // console.log("Processing line:", line); // Log từng dòng được xử lý
 
-                    if (line.startsWith('data:')) {
-                        const dataString = line.substring(5).trim();
-                        console.log("Parsed dataString:", dataString); // Log dataString
+                    // --- SỬA LỖI: Kiểm tra '[DONE]' trước khi parse JSON ---
+                    if (line === '[DONE]') {
+                        console.log("Received [DONE] signal from OpenAI. Ending client response.");
+                        res.write('data: [DONE]\n\n'); // Gửi tín hiệu DONE về client
+                        res.end(); // Kết thúc phản hồi HTTP
+                        return; // Thoát khỏi handler function
+                    } else if (line.startsWith('data:')) {
+                        const dataString = line.substring(5).trim(); // Bỏ "data: "
+                        // console.log("Parsed dataString (before JSON.parse):", dataString);
+
                         try {
                             const parsedData = JSON.parse(dataString);
-                            // Kiểm tra xem parsedData có phải là một delta message không
-                            if (parsedData.event === 'thread.message.delta' && parsedData.data.delta.content?.[0]?.type === 'text' && parsedData.data.delta.content?.[0]?.text?.value) {
+                            // console.log("Parsed OpenAI event:", parsedData.event, parsedData.data);
+
+                            // Lọc và chuyển tiếp chỉ các chunk văn bản (text_delta)
+                            if (parsedData.event === 'thread.message.delta' &&
+                                parsedData.data?.delta?.content?.[0]?.type === 'text' &&
+                                parsedData.data.delta.content[0].text?.value) {
+
                                 const replyChunk = parsedData.data.delta.content[0].text.value;
-                                console.log("Extracted replyChunk:", replyChunk); // Log chunk văn bản
-                                res.write(`data: ${JSON.stringify({ reply_chunk: replyChunk })}\n\n`);
-                            } else if (parsedData.event === 'thread.run.completed') {
-                                // Nếu nhận được sự kiện run completed, có thể gửi một chunk rỗng hoặc tín hiệu kết thúc nếu cần
-                                console.log("Run completed event received.");
+                                // console.log("Extracted replyChunk:", replyChunk);
+                                res.write(`data: ${JSON.stringify({ reply_chunk: replyChunk })}\n\n`); // Gửi chunk về client
                             }
-                            // Bạn có thể xử lý các loại sự kiện khác nếu muốn
+                            // Bạn có thể thêm xử lý cho các loại event khác nếu cần (ví dụ: tool_calls)
+                            // Ví dụ: if (parsedData.event === 'thread.tool.steps.delta') { ... }
+
                         } catch (e) {
-                            console.error("Error parsing JSON from stream line:", e, "Line:", line); // Log lỗi parsing JSON
+                            // Xử lý lỗi khi JSON.parse thất bại (ví dụ: dòng trống, JSON không hợp lệ khác)
+                            console.error("Error parsing JSON from OpenAI stream line:", e.message, "Line:", line);
                         }
-                    } else if (line === '[DONE]') {
-                        console.log("[DONE] signal received."); // Log tín hiệu DONE
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                        return;
                     }
-                    startIndex = newlineIndex + 1;
+                    startIndex = newlineIndex + 1; // Di chuyển con trỏ đến sau dòng đã xử lý
                 }
+                // Giữ lại phần dữ liệu chưa hoàn chỉnh (không kết thúc bằng '\n') cho lần đọc tiếp theo
                 accumulatedData = accumulatedData.substring(startIndex);
             }
-            // Nếu luồng kết thúc mà không có [DONE] rõ ràng
-            console.log("Stream ended without explicit [DONE]. Sending final [DONE].");
+
+            // Fallback: Nếu luồng kết thúc mà không nhận được [DONE] (rất hiếm, nhưng để an toàn)
+            console.log("OpenAI stream ended without explicit [DONE] signal. Sending final [DONE].");
             res.write('data: [DONE]\n\n');
             res.end();
 
         } else {
-            // Logic non-streaming cũ (poll tới khi run hoàn thành)
-            // ... (giữ nguyên code cũ nếu bạn vẫn muốn hỗ trợ non-streaming)
+            // ---------- LOGIC NON-STREAMING (Duy trì nếu bạn muốn hỗ trợ) ----------
+            console.log("Non-streaming mode: Polling run status...");
             const { id: run_id } = await runRes.json();
             let status = "queued";
-            console.log("Non-streaming: Polling run status...");
             while (status !== "completed") {
-                await new Promise((r) => setTimeout(r, 1000));
+                await new Promise((r) => setTimeout(r, 1000)); // Đợi 1 giây trước khi poll lại
                 const checkRes = await fetch(
                     `https://api.openai.com/v1/threads/${thread_id}/runs/${run_id}`,
                     {
@@ -400,14 +414,14 @@ export default async function handler(req, res) {
 
                 const check = await checkRes.json();
                 status = check.status;
-                console.log("Polling status:", status);
+                console.log(`Polling run ${run_id} status: ${status}`);
 
                 if (["failed", "cancelled", "expired"].includes(status)) {
-                    throw new Error(`Run ended with status: ${status}`);
+                    throw new Error(`Run ended with status: ${status}. Detail: ${JSON.stringify(check.last_error || 'No error details')}`);
                 }
             }
 
-            console.log("Run completed. Fetching last message...");
+            console.log("Run completed. Fetching the last assistant message...");
             const lastMsgRes = await fetch(
                 `https://api.openai.com/v1/threads/${thread_id}/messages?limit=1`,
                 {
@@ -422,20 +436,25 @@ export default async function handler(req, res) {
             const reply =
                 data?.[0]?.content?.[0]?.text?.value ??
                 "Xin lỗi, mình chưa có thông tin để trả lời.";
-            console.log("Final reply (non-streaming):", reply);
+
+            console.log("Non-streaming: Final reply:", reply);
             return res.status(200).json({ reply, thread_id });
         }
 
     } catch (err) {
-        console.error("GPT Error in catch block:", err); // Log lỗi chung
+        console.error("Caught error in handler:", err);
+        const errorMessage = err.message || "An unknown error occurred.";
+
         if (stream) {
-            res.write(`data: ${JSON.stringify({ error: "GPT Error", detail: err.message ?? String(err) })}\n\n`);
-            res.write(`data: [DONE]\n\n`);
+            // Gửi lỗi qua luồng nếu đang streaming
+            res.write(`data: ${JSON.stringify({ error: "Backend error", detail: errorMessage })}\n\n`);
+            res.write('data: [DONE]\n\n');
             res.end();
         } else {
+            // Trả về lỗi JSON nếu không streaming
             return res
                 .status(500)
-                .json({ error: "GPT Error", detail: err.message ?? String(err) });
+                .json({ error: "Backend error", detail: errorMessage });
         }
     }
 }
