@@ -178,8 +178,11 @@
 //   }
 // }
 
-// /api/sendMessage.ts
-export const config = { runtime: "nodejs18.x" };   // Vercel ≥ v28
+// /api/sendMessage.js
+export const config = {
+  runtime: "nodejs",   // ✅ giá trị hợp lệ
+  maxDuration: 30      // (giữ nguyên nếu cần)
+};
 
 import { createParser } from "eventsource-parser"; // tiny lib, 1.3 kB
 
