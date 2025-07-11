@@ -179,7 +179,7 @@
 // }
 
 export const config = {
-  runtime: "nodejs20.x", // Node 20 Isolate (cold‑start < 100 ms)
+  runtime: "nodejs", // Node 20 Isolate (cold‑start < 100 ms)
   maxDuration: 30        // giây
 };
 
